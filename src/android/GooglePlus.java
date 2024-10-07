@@ -6,22 +6,37 @@ import android.accounts.AccountManagerFuture;
 import android.accounts.AuthenticatorException;
 import android.accounts.OperationCanceledException;
 import android.app.Activity;
+import android.app.PendingIntent;
 import android.content.Intent;
+import android.content.IntentSender;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.os.AsyncTask;
 import android.os.Bundle;
 import android.util.Log;
+import android.os.CancellationSignal;
 
-import com.google.android.gms.auth.api.Auth;
-import com.google.android.gms.auth.api.signin.GoogleSignInResult;
-import com.google.android.gms.auth.api.signin.GoogleSignInOptions;
-import com.google.android.gms.auth.api.signin.GoogleSignInAccount;
-import com.google.android.gms.common.ConnectionResult;
-import com.google.android.gms.common.api.GoogleApiClient;
-import com.google.android.gms.common.api.ResultCallback;
-import com.google.android.gms.common.api.Status;
+import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption;
+import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential;
+import com.google.android.gms.auth.api.identity.AuthorizationClient;
+import com.google.android.gms.auth.api.identity.Identity;
+import com.google.android.gms.auth.api.identity.AuthorizationRequest;
+import com.google.android.gms.auth.api.identity.AuthorizationResult;
+import com.google.android.gms.common.Scopes;
 import com.google.android.gms.common.api.Scope;
+import com.google.android.gms.common.api.ApiException;
+import androidx.activity.result.contract.ActivityResultContract;
+import androidx.annotation.NonNull;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.credentials.Credential;
+import androidx.credentials.CustomCredential;
+import androidx.credentials.CredentialManager;
+import androidx.credentials.CredentialManagerCallback;
+import androidx.credentials.ClearCredentialStateRequest;
+import androidx.credentials.GetCredentialRequest;
+import androidx.credentials.GetCredentialResponse;
+import androidx.credentials.exceptions.ClearCredentialException;
+import androidx.credentials.exceptions.GetCredentialException;
 
 import org.apache.cordova.*;
 import org.apache.cordova.engine.SystemWebChromeClient;
@@ -37,12 +52,17 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.security.MessageDigest;
 import android.content.pm.Signature;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
+import java.util.List;
+import java.util.Arrays;
+import java.util.stream.Collectors;
 
 /**
  * Originally written by Eddy Verbruggen (http://github.com/EddyVerbruggen/cordova-plugin-googleplus)
  * Forked/Duplicated and Modified by PointSource, LLC, 2016.
  */
-public class GooglePlus extends CordovaPlugin implements GoogleApiClient.OnConnectionFailedListener {
+public class GooglePlus extends CordovaPlugin {
 
     public static final String ACTION_IS_AVAILABLE = "isAvailable";
     public static final String ACTION_LOGIN = "login";
@@ -67,8 +87,12 @@ public class GooglePlus extends CordovaPlugin implements GoogleApiClient.OnConne
     public static final int KAssumeStaleTokenSec = 60;
 
     // Wraps our service connection to Google Play services and provides access to the users sign in state and Google APIs
-    private GoogleApiClient mGoogleApiClient;
+    // private GoogleApiClient mGoogleApiClient;
     private CallbackContext savedCallbackContext;
+
+    private String scopes;
+    private String webClientId;
+    private JSONObject activityReturnObject;
 
     @Override
     public void initialize(CordovaInterface cordova, CordovaWebView webView) {
@@ -84,31 +108,16 @@ public class GooglePlus extends CordovaPlugin implements GoogleApiClient.OnConne
             savedCallbackContext.success("" + avail);
 
         } else if (ACTION_LOGIN.equals(action)) {
-            //pass args into api client build
-            buildGoogleApiClient(args.optJSONObject(0));
+            //pass args into the sign in request
+            startSignIn(args.optJSONObject(0));
 
             // Tries to Log the user in
             Log.i(TAG, "Trying to Log in!");
             cordova.setActivityResultCallback(this); //sets this class instance to be an activity result listener
-            signIn();
-
-        } else if (ACTION_TRY_SILENT_LOGIN.equals(action)) {
-            //pass args into api client build
-            buildGoogleApiClient(args.optJSONObject(0));
-
-            Log.i(TAG, "Trying to do silent login!");
-            trySilentLogin();
 
         } else if (ACTION_LOGOUT.equals(action)) {
             Log.i(TAG, "Trying to logout!");
             signOut();
-
-        } else if (ACTION_DISCONNECT.equals(action)) {
-            Log.i(TAG, "Trying to disconnect the user");
-            disconnect();
-
-        } else if (ACTION_GET_SIGNING_CERTIFICATE_FINGERPRINT.equals(action)) {
-            getSigningCertificateFingerprint();
 
         } else {
             Log.i(TAG, "This action doesn't exist");
@@ -119,92 +128,175 @@ public class GooglePlus extends CordovaPlugin implements GoogleApiClient.OnConne
     }
 
     /**
-     * Set options for login and Build the GoogleApiClient if it has not already been built.
+     * Create a credential manager object and request credentials
      * @param clientOptions - the options object passed in the login function
      */
-    private synchronized void buildGoogleApiClient(JSONObject clientOptions) throws JSONException {
+    private synchronized void startSignIn(JSONObject clientOptions) throws JSONException {
         if (clientOptions == null) {
             return;
         }
 
-        //If options have been passed in, they could be different, so force a rebuild of the client
-        // disconnect old client iff it exists
-        if (this.mGoogleApiClient != null) this.mGoogleApiClient.disconnect();
-        // nullify
-        this.mGoogleApiClient = null;
-
-        Log.i(TAG, "Building Google options");
-
-        // Make our SignIn Options builder.
-        GoogleSignInOptions.Builder gso = new GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN);
-
-        // request the default scopes
-        gso.requestEmail().requestProfile();
-
-        // We're building the scopes on the Options object instead of the API Client
-        // b/c of what was said under the "addScope" method here:
-        // https://developers.google.com/android/reference/com/google/android/gms/common/api/GoogleApiClient.Builder.html#public-methods
-        String scopes = clientOptions.optString(ARGUMENT_SCOPES, null);
-
-        if (scopes != null && !scopes.isEmpty()) {
-            // We have a string of scopes passed in. Split by space and request
-            for (String scope : scopes.split(" ")) {
-                gso.requestScopes(new Scope(scope));
-            }
-        }
-
         // Try to get web client id
-        String webClientId = clientOptions.optString(ARGUMENT_WEB_CLIENT_ID, null);
+        this.webClientId = clientOptions.optString(ARGUMENT_WEB_CLIENT_ID, null);
 
-        // if webClientId included, we'll request an idToken
-        if (webClientId != null && !webClientId.isEmpty()) {
-            gso.requestIdToken(webClientId);
+        this.scopes = clientOptions.optString(ARGUMENT_SCOPES, null);
 
-            // if webClientId is included AND offline is true, we'll request the serverAuthCode
-            if (clientOptions.optBoolean(ARGUMENT_OFFLINE_KEY, false)) {
-                gso.requestServerAuthCode(webClientId, true);
+        GetSignInWithGoogleOption signInWithGoogleOption = new GetSignInWithGoogleOption.Builder(this.webClientId)
+            .build();
+
+        // Build the credential request with the web client id
+        GetCredentialRequest request = new GetCredentialRequest.Builder()
+            .addCredentialOption(signInWithGoogleOption)
+            .build();
+
+        // Create a CredentialManager object with the current context
+        CredentialManager credentialManager = CredentialManager.create(webView.getContext());
+
+        // Create an Executor, used for async calls
+        Executor executor = Executors.newSingleThreadExecutor();
+        // Create a CancellationSignal, currently not used but can be activated to cancel the request
+        CancellationSignal cancellationSignal = new CancellationSignal();
+
+        // Define the callback
+        CredentialManagerCallback<GetCredentialResponse, GetCredentialException> callback = new CredentialManagerCallback<GetCredentialResponse, GetCredentialException>() {
+            @Override
+            public void onResult(@NonNull GetCredentialResponse result) {
+
+                handleSignIn(result);               
             }
-        }
 
-        // Try to get hosted domain
-        String hostedDomain = clientOptions.optString(ARGUMENT_HOSTED_DOMAIN, null);
+            @Override
+            public void onError(@NonNull GetCredentialException e) {
+                // Handle the error
+                Log.e(TAG, "Credential retrieval failed: " + e.getMessage());
+            }
+        };
 
-        // if hostedDomain included, we'll request a hosted domain account
-        if (hostedDomain != null && !hostedDomain.isEmpty()) {
-            gso.setHostedDomain(hostedDomain);
-        }
-
-        //Now that we have our options, let's build our Client
-        Log.i(TAG, "Building GoogleApiClient");
-
-        GoogleApiClient.Builder builder = new GoogleApiClient.Builder(webView.getContext())
-            .addOnConnectionFailedListener(this)
-            .addApi(Auth.GOOGLE_SIGN_IN_API, gso.build());
-
-        this.mGoogleApiClient = builder.build();
+        // Start the sign in request
+        credentialManager.getCredentialAsync(
+            webView.getContext(),
+            request,
+            cancellationSignal,
+            executor,
+            callback
+        );
 
         Log.i(TAG, "GoogleApiClient built");
     }
 
-    // The Following functions were implemented in reference to Google's example here:
-    // https://github.com/googlesamples/google-services/blob/master/android/signin/app/src/main/java/com/google/samples/quickstart/signin/SignInActivity.java
-
     /**
-     * Starts the sign in flow with a new Intent, which should respond to our activity listener here.
+     * Handle the result of the sign in request and start the authorization request to retrieve the serverAuthCode
+     * @param result - the result of the sign in request
      */
-    private void signIn() {
-        Intent signInIntent = Auth.GoogleSignInApi.getSignInIntent(this.mGoogleApiClient);
-        cordova.getActivity().startActivityForResult(signInIntent, RC_GOOGLEPLUS);
+    private void handleSignIn(GetCredentialResponse result) {
+
+        // Handle the retrieved credential
+        Log.i(TAG, "Credential retrieved successfully");
+
+        Credential credential = result.getCredential();
+
+        if (credential instanceof CustomCredential) {
+            if (GoogleIdTokenCredential.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL.equals(credential.getType())) {
+                GoogleIdTokenCredential googleIdTokenCredential = GoogleIdTokenCredential.createFrom(((CustomCredential) credential).getData());
+                String token = googleIdTokenCredential.getIdToken();
+
+                String[] scopesArray = scopes.split(" ");
+                List<Scope> requestedScopes = Arrays.stream(scopesArray)
+                                                    .map(Scope::new)
+                                                    .collect(Collectors.toList());
+
+                AuthorizationRequest authorizationRequest = 
+                    AuthorizationRequest.builder()
+                        .setRequestedScopes(requestedScopes)
+                        .requestOfflineAccess(this.webClientId)
+                        .build();
+                        
+                Identity.getAuthorizationClient(webView.getContext())
+                        .authorize(authorizationRequest)
+                        .addOnSuccessListener(
+                            authorizationResult -> {
+
+                            // Prepare the return object with the data that's available from the credential response
+                            JSONObject returnObject = new JSONObject();
+                            try {
+                                returnObject.put("email", googleIdTokenCredential.getId());
+                                returnObject.put("idToken", googleIdTokenCredential.getIdToken());
+                                returnObject.put("serverAuthCode", authorizationResult.getServerAuthCode());
+                                returnObject.put("userId", googleIdTokenCredential.getId());
+                                returnObject.put("displayName", googleIdTokenCredential.getDisplayName());
+                                returnObject.put("familyName", googleIdTokenCredential.getFamilyName());
+                                returnObject.put("givenName", googleIdTokenCredential.getGivenName());
+                                returnObject.put("imageUrl", googleIdTokenCredential.getProfilePictureUri());
+                            } catch (Exception e) {
+                                savedCallbackContext.error("Trouble obtaining result, error: " + e.getMessage());
+                            }
+
+                            if (authorizationResult.hasResolution()) {
+                                // Store the return object to be used later in the authorization callback
+                                activityReturnObject = returnObject;
+                                // Access needs to be granted by the user
+                                PendingIntent pendingIntent = authorizationResult.getPendingIntent();
+                                try {
+                                    // Start the intent to prompt the user
+                                    cordova.getActivity().startIntentSenderForResult(
+                                        pendingIntent.getIntentSender(),
+                                        RC_GOOGLEPLUS,
+                                        null,
+                                        0,
+                                        0,
+                                        0
+                                    );
+                                } catch (IntentSender.SendIntentException e) {
+                                    Log.e(TAG, "Couldn't start Authorization UI: " + e.getLocalizedMessage());
+                                    savedCallbackContext.error("Couldn't start Authorization UI");
+                                }
+                            } else {
+                                // Access already granted, continue with user action
+                                Log.i(TAG, "Already authorized: ");
+                                savedCallbackContext.success(returnObject);
+                            }
+                            })
+                        .addOnFailureListener(e -> savedCallbackContext.error("Couldn't complete Authorization"));
+
+                
+            }
+        }
+        else {
+            Log.e(TAG, "Credential is not a GoogleIdTokenCredential");
+            savedCallbackContext.error("Credential is not a GoogleIdTokenCredential");
+        }
     }
 
-    /**
-     * Tries to log the user in silently using existing sign in result information
-     */
-    private void trySilentLogin() {
-        ConnectionResult apiConnect =  mGoogleApiClient.blockingConnect();
+    @Override
+    public void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == RC_GOOGLEPLUS) {
+            if (resultCode == Activity.RESULT_OK) {
+                // Handle successful authorization
+                Log.i(TAG, "Authorization successful");
 
-        if (apiConnect.isSuccess()) {
-            handleSignInResult(Auth.GoogleSignInApi.silentSignIn(this.mGoogleApiClient).await());
+                // Retrieve the serverAuthCode
+                try {
+                    AuthorizationResult authorizationResult = Identity.getAuthorizationClient(webView.getContext()).getAuthorizationResultFromIntent(data);
+                    String serverAuthCode = authorizationResult.getServerAuthCode();
+
+                    try {
+                        activityReturnObject.put("serverAuthCode", serverAuthCode); // Add the serverAuthCode to the result
+                        savedCallbackContext.success(activityReturnObject);
+                    } catch (JSONException e) {
+                        savedCallbackContext.error("Trouble adding serverAuthCode, error: " + e.getMessage());
+                    }
+
+                } catch (ApiException e) {
+                    Log.e(TAG, "Couldn't get serverAuthCode: " + e.getLocalizedMessage());
+                    savedCallbackContext.error("Couldn't get serverAuthCode");
+                }
+                
+            } else {
+                // Handle authorization failure
+                Log.e(TAG, "Authorization failed");
+                savedCallbackContext.error("Authorization failed");
+            }
         }
     }
 
@@ -212,247 +304,37 @@ public class GooglePlus extends CordovaPlugin implements GoogleApiClient.OnConne
      * Signs the user out from the client
      */
     private void signOut() {
-        if (this.mGoogleApiClient == null) {
-            savedCallbackContext.error("Please use login or trySilentLogin before logging out");
-            return;
-        }
 
-        ConnectionResult apiConnect = mGoogleApiClient.blockingConnect();
+        // String type = ClearCredentialStateRequest.TYPE_CLEAR_CREDENTIAL_STATE;
+        ClearCredentialStateRequest request = new ClearCredentialStateRequest();
+        CredentialManager credentialManager = CredentialManager.create(webView.getContext());
 
-        if (apiConnect.isSuccess()) {
-            Auth.GoogleSignInApi.signOut(this.mGoogleApiClient).setResultCallback(
-                    new ResultCallback<Status>() {
-                        @Override
-                        public void onResult(Status status) {
-                            //on success, tell cordova
-                            if (status.isSuccess()) {
-                                savedCallbackContext.success("Logged user out");
-                            } else {
-                                savedCallbackContext.error(status.getStatusCode());
-                            }
-                        }
-                    }
-            );
-        }
-    }
+        // Create an Executor
+        Executor executor = Executors.newSingleThreadExecutor();
+        // Create a CancellationSignal
+        CancellationSignal cancellationSignal = new CancellationSignal();
 
-    /**
-     * Disconnects the user and revokes access
-     */
-    private void disconnect() {
-        if (this.mGoogleApiClient == null) {
-            savedCallbackContext.error("Please use login or trySilentLogin before disconnecting");
-            return;
-        }
+        // Define the callback
+        CredentialManagerCallback<Void, ClearCredentialException> callback = new CredentialManagerCallback<Void, ClearCredentialException>() {
+            @Override
+            public void onResult(Void result) {
 
-        ConnectionResult apiConnect = mGoogleApiClient.blockingConnect();
-
-        if (apiConnect.isSuccess()) {
-            Auth.GoogleSignInApi.revokeAccess(this.mGoogleApiClient).setResultCallback(
-                    new ResultCallback<Status>() {
-                        @Override
-                        public void onResult(Status status) {
-                            if (status.isSuccess()) {
-                                savedCallbackContext.success("Disconnected user");
-                            } else {
-                                savedCallbackContext.error(status.getStatusCode());
-                            }
-                        }
-                    }
-            );
-        }
-    }
-
-    /**
-     * Handles failure in connecting to google apis.
-     *
-     * @param result is the ConnectionResult to potentially catch
-     */
-    @Override
-    public void onConnectionFailed(ConnectionResult result) {
-        Log.i(TAG, "Unresolvable failure in connecting to Google APIs");
-        savedCallbackContext.error(result.getErrorCode());
-    }
-
-    /**
-     * Listens for and responds to an activity result. If the activity result request code matches our own,
-     * we know that the sign in Intent that we started has completed.
-     *
-     * The result is retrieved and send to the handleSignInResult function.
-     *
-     * @param requestCode The request code originally supplied to startActivityForResult(),
-     * @param resultCode The integer result code returned by the child activity through its setResult().
-     * @param intent Information returned by the child activity
-     */
-    @Override
-    public void onActivityResult(int requestCode, final int resultCode, final Intent intent) {
-        super.onActivityResult(requestCode, resultCode, intent);
-
-        Log.i(TAG, "In onActivityResult");
-
-        if (requestCode == RC_GOOGLEPLUS) {
-            Log.i(TAG, "One of our activities finished up");
-            //Call handleSignInResult passing in sign in result object
-            handleSignInResult(Auth.GoogleSignInApi.getSignInResultFromIntent(intent));
-        }
-        else {
-            Log.i(TAG, "This wasn't one of our activities");
-        }
-    }
-
-    /**
-     * Function for handling the sign in result
-     * Handles the result of the authentication workflow.
-     *
-     * If the sign in was successful, we build and return an object containing the users email, id, displayname,
-     * id token, and (optionally) the server authcode.
-     *
-     * If sign in was not successful, for some reason, we return the status code to web app to be handled.
-     * Some important Status Codes:
-     *      SIGN_IN_CANCELLED = 12501 -> cancelled by the user, flow exited, oauth consent denied
-     *      SIGN_IN_FAILED = 12500 -> sign in attempt didn't succeed with the current account
-     *      SIGN_IN_REQUIRED = 4 -> Sign in is needed to access API but the user is not signed in
-     *      INTERNAL_ERROR = 8
-     *      NETWORK_ERROR = 7
-     *
-     * @param signInResult - the GoogleSignInResult object retrieved in the onActivityResult method.
-     */
-    private void handleSignInResult(final GoogleSignInResult signInResult) {
-        if (this.mGoogleApiClient == null) {
-            savedCallbackContext.error("GoogleApiClient was never initialized");
-            return;
-        }
-
-        if (signInResult == null) {
-          savedCallbackContext.error("SignInResult is null");
-          return;
-        }
-
-        Log.i(TAG, "Handling SignIn Result");
-
-        if (!signInResult.isSuccess()) {
-            Log.i(TAG, "Wasn't signed in");
-
-            //Return the status code to be handled client side
-            savedCallbackContext.error(signInResult.getStatus().getStatusCode());
-        } else {
-            new AsyncTask<Void, Void, Void>() {
-                @Override
-                protected Void doInBackground(Void... params) {
-                    GoogleSignInAccount acct = signInResult.getSignInAccount();
-                    JSONObject result = new JSONObject();
-                    try {
-                        JSONObject accessTokenBundle = getAuthToken(
-                            cordova.getActivity(), acct.getAccount(), true
-                        );
-                        result.put(FIELD_ACCESS_TOKEN, accessTokenBundle.get(FIELD_ACCESS_TOKEN));
-                        result.put(FIELD_TOKEN_EXPIRES, accessTokenBundle.get(FIELD_TOKEN_EXPIRES));
-                        result.put(FIELD_TOKEN_EXPIRES_IN, accessTokenBundle.get(FIELD_TOKEN_EXPIRES_IN));
-                        result.put("email", acct.getEmail());
-                        result.put("idToken", acct.getIdToken());
-                        result.put("serverAuthCode", acct.getServerAuthCode());
-                        result.put("userId", acct.getId());
-                        result.put("displayName", acct.getDisplayName());
-                        result.put("familyName", acct.getFamilyName());
-                        result.put("givenName", acct.getGivenName());
-                        result.put("imageUrl", acct.getPhotoUrl());
-                        savedCallbackContext.success(result);
-                    } catch (Exception e) {
-                        savedCallbackContext.error("Trouble obtaining result, error: " + e.getMessage());
-                    }
-                    return null;
-                }
-            }.execute();
-        }
-    }
-
-    private void getSigningCertificateFingerprint() {
-        String packageName = webView.getContext().getPackageName();
-        int flags = PackageManager.GET_SIGNATURES;
-        PackageManager pm = webView.getContext().getPackageManager();
-        try {
-            PackageInfo packageInfo = pm.getPackageInfo(packageName, flags);
-            Signature[] signatures = packageInfo.signatures;
-            byte[] cert = signatures[0].toByteArray();
-
-            String strResult = "";
-            MessageDigest md;
-            md = MessageDigest.getInstance("SHA1");
-            md.update(cert);
-            for (byte b : md.digest()) {
-                String strAppend = Integer.toString(b & 0xff, 16);
-                if (strAppend.length() == 1) {
-                    strResult += "0";
-                }
-                strResult += strAppend;
-                strResult += ":";
+                savedCallbackContext.success("Logged user out");               
             }
-            // strip the last ':'
-            strResult = strResult.substring(0, strResult.length()-1);
-            strResult = strResult.toUpperCase();
-            this.savedCallbackContext.success(strResult);
 
-        } catch (Exception e) {
-            e.printStackTrace();
-            savedCallbackContext.error(e.getMessage());
-        }
-    }
-
-    private JSONObject getAuthToken(Activity activity, Account account, boolean retry) throws Exception {
-        AccountManager manager = AccountManager.get(activity);
-        AccountManagerFuture<Bundle> future = manager.getAuthToken(account, "oauth2:profile email", null, activity, null, null);
-        Bundle bundle = future.getResult();
-        String authToken = bundle.getString(AccountManager.KEY_AUTHTOKEN);
-        try {
-            return verifyToken(authToken);
-        } catch (IOException e) {
-            if (retry) {
-                manager.invalidateAuthToken("com.google", authToken);
-                return getAuthToken(activity, account, false);
-            } else {
-                throw e;
+            @Override
+            public void onError(@NonNull ClearCredentialException e) {
+                // Handle the error
+                Log.e(TAG, "Credential clear failed: " + e.getMessage());
+                savedCallbackContext.error(e.getMessage());
             }
-        }
-    }
+        };
 
-    private JSONObject verifyToken(String authToken) throws IOException, JSONException {
-        URL url = new URL(VERIFY_TOKEN_URL+authToken);
-        HttpURLConnection urlConnection = (HttpURLConnection) url.openConnection();
-        urlConnection.setInstanceFollowRedirects(true);
-        String stringResponse = fromStream(
-            new BufferedInputStream(urlConnection.getInputStream())
+        credentialManager.clearCredentialStateAsync(
+            request,
+            cancellationSignal,
+            executor,
+            callback
         );
-        /* expecting:
-        {
-            "issued_to": "608941808256-43vtfndets79kf5hac8ieujto8837660.apps.googleusercontent.com",
-            "audience": "608941808256-43vtfndets79kf5hac8ieujto8837660.apps.googleusercontent.com",
-            "user_id": "107046534809469736555",
-            "scope": "https://www.googleapis.com/auth/userinfo.profile",
-            "expires_in": 3595,
-            "access_type": "offline"
-        }*/
-
-        Log.d("AuthenticatedBackend", "token: " + authToken + ", verification: " + stringResponse);
-        JSONObject jsonResponse = new JSONObject(
-            stringResponse
-        );
-        int expires_in = jsonResponse.getInt(FIELD_TOKEN_EXPIRES_IN);
-        if (expires_in < KAssumeStaleTokenSec) {
-            throw new IOException("Auth token soon expiring.");
-        }
-        jsonResponse.put(FIELD_ACCESS_TOKEN, authToken);
-        jsonResponse.put(FIELD_TOKEN_EXPIRES, expires_in + (System.currentTimeMillis()/1000));
-        return jsonResponse;
-    }
-
-    public static String fromStream(InputStream is) throws IOException {
-        BufferedReader reader = new BufferedReader(new InputStreamReader(is));
-        StringBuilder sb = new StringBuilder();
-        String line = null;
-        while ((line = reader.readLine()) != null) {
-            sb.append(line).append("\n");
-        }
-        reader.close();
-        return sb.toString();
     }
 }
