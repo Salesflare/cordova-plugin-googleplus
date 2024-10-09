@@ -1,5 +1,5 @@
 {
-  "version": "9.0.2",
+  "version": "9.0.3",
   "name": "@salesflare/cordova-plugin-googleplus",
   "cordova_name": "Google SignIn",
   "description": "Use your Google account to authenticate with the app.",
