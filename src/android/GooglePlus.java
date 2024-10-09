@@ -305,7 +305,7 @@ public class GooglePlus extends CordovaPlugin {
             } else {
                 // Handle authorization failure
                 Log.e(TAG, "Authorization failed");
-                savedCallbackContext.error("Authorization failed");
+                savedCallbackContext.error(RC_CANCELATION);
             }
         }
     }
