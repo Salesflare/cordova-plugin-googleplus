@@ -84,6 +84,7 @@ public class GooglePlus extends CordovaPlugin {
 
     public static final String TAG = "GooglePlugin";
     public static final int RC_GOOGLEPLUS = 1552; // Request Code to identify our plugin's activities
+    public static final int RC_CANCELATION = 12501; // Response code for when the user cancels the sign in request
     public static final int KAssumeStaleTokenSec = 60;
 
     // Wraps our service connection to Google Play services and provides access to the users sign in state and Google APIs
@@ -168,7 +169,15 @@ public class GooglePlus extends CordovaPlugin {
             @Override
             public void onError(@NonNull GetCredentialException e) {
                 // Handle the error
-                Log.e(TAG, "Credential retrieval failed: " + e.getMessage());
+                if (e instanceof GetCredentialCancellationException) {
+                    // Handle the specific case where the exception is of type GetCredentialCancellationException
+                    Log.e(TAG, "Credential retrieval was cancelled: " + e.getMessage());
+                    savedCallbackContext.error(RC_CANCELATION);
+                } else {
+                    // Handle other types of GetCredentialException
+                    Log.e(TAG, "Credential retrieval failed: " + e.getMessage());
+                    savedCallbackContext.error("Credential retrieval failed: " + e.getMessage());
+                }
             }
         };
 
